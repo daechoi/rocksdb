@@ -1,9 +1,8 @@
 #include "env_cfs.h"
-
+#include "cfs_writable.h"
 #include <rocksdb/env.h>
 
 #include <stdio.h>
-#include <sys/time.h>
 #include <algorithm>
 #include <iostream>
 #include <sstream>
@@ -53,7 +52,6 @@ static IOStatus IOError(const std::string& context, int err_number) {
 
 // assume that there is one global logger for now. It is not thread-safe,
 // but need not be because the logger is initialized at db-open time.
-static Logger* mylog = nullptr;
 
 // Used for reading a file from cfs. It implements both sequential-read
 // access methods as well as random read access methods.
@@ -113,172 +111,6 @@ class CfsReadableFile : virtual public FSSequentialFile,
     ROCKS_LOG_DEBUG(mylog, "[cfs] CfsReadableFile feof %s\n",
                     filename_.c_str());
    return true;
-  }
-};
-
-// Appends to an existing file in cfs.
-class CfsWritableFile: public FSWritableFile {
- private:
-    std::string filename_;
-
- public:
-  CfsWritableFile(const std::string& fname,
-                   const FileOptions& options)
-      : FSWritableFile(options),
-        filename_(fname){
-    ROCKS_LOG_DEBUG(mylog, "[cfs] CfsWritableFile opening %s\n",
-                    filename_.c_str());
-  }
-  ~CfsWritableFile() override {
-      ROCKS_LOG_DEBUG(mylog, "[cfs] CfsWritableFile closing %s\n",
-                      filename_.c_str());
-//      cfsCloseFile(fileSys_, hfile_);
-    }
-
-  using FSWritableFile::Append;
-
-  // The name of the file, mostly needed for debug logging.
-  const std::string& getName() {
-    return filename_;
-  }
-
-  bool isValid(){
-    return true;
-  }
-
-  IOStatus Append(const Slice& data, const IOOptions& /*options*/,
-                  IODebugContext* /*dbg*/) override {
-    ROCKS_LOG_DEBUG(mylog, "[cfs] CfsWritableFile Append %s\n",
-                    filename_.c_str());
-    const char* src = data.data();
-    size_t left = data.size();
-//    size_t ret = cfsWrite(fileSys_, hfile_, src, static_cast<tSize>(left));
-     return IOStatus::OK();
-  }
-
-  // This is used by cfsLogger to write data to the debug log file
-  IOStatus Append(const char* src, size_t size) {
-     return IOStatus::OK();
-  }
-  
-  IOStatus Flush(const IOOptions& /*options*/,
-                 IODebugContext* /*dbg*/) override {
-    return IOStatus::OK();
-  }
-
-  IOStatus Sync(const IOOptions& /*options*/,
-                IODebugContext* /*dbg*/) override {
-    ROCKS_LOG_DEBUG(mylog, "[cfs] CfsWritableFile Sync %s\n",
-                    filename_.c_str());
-     return IOStatus::OK();
-  }
-
-
-  IOStatus Close(const IOOptions& /*options*/,
-                  IODebugContext* /*dbg*/) override {
-    ROCKS_LOG_DEBUG(mylog, "[cfs] CfsWritableFile closing %s\n",
-                    filename_.c_str());
-     return IOStatus::OK();
-  }
-};
-
-// The object that implements the debug logs to reside in cfs.
-class CfsLogger : public Logger {
- private:
-  CfsWritableFile* file_;
-
-  Status CfsCloseHelper() {
-    ROCKS_LOG_DEBUG(mylog, "[cfs] CfsLogger closed %s\n",
-                    file_->getName().c_str());
-    if (mylog != nullptr && mylog == this) {
-      mylog = nullptr;
-    }
-    return Status::OK();
-  }
-
- protected:
-  virtual Status CloseImpl() override { return CfsCloseHelper(); }
-
- public:
-  CfsLogger(CfsWritableFile* f)
-      : file_(f) {
-    ROCKS_LOG_DEBUG(mylog, "[cfs] CfsLogger opened %s\n",
-                    file_->getName().c_str());
-  }
-
-  ~CfsLogger() override {
-    if (!closed_) {
-      closed_ = true;
-      CfsCloseHelper().PermitUncheckedError();
-    }
-  }
-
-  using Logger::Logv;
-  void Logv(const char* format, va_list ap) override {
-    const uint64_t thread_id = Env::Default()->GetThreadID();
-
-    // We try twice: the first time with a fixed-size stack allocated buffer,
-    // and the second time with a much larger dynamically allocated buffer.
-    char buffer[500];
-    for (int iter = 0; iter < 2; iter++) {
-      char* base;
-      int bufsize;
-      if (iter == 0) {
-        bufsize = sizeof(buffer);
-        base = buffer;
-      } else {
-        bufsize = 30000;
-        base = new char[bufsize];
-      }
-      char* p = base;
-      char* limit = base + bufsize;
-
-      struct timeval now_tv;
-      gettimeofday(&now_tv, nullptr);
-      const time_t seconds = now_tv.tv_sec;
-      struct tm t;
-      localtime_r(&seconds, &t);
-      p += snprintf(p, limit - p,
-                    "%04d/%02d/%02d-%02d:%02d:%02d.%06d %llx ",
-                    t.tm_year + 1900,
-                    t.tm_mon + 1,
-                    t.tm_mday,
-                    t.tm_hour,
-                    t.tm_min,
-                    t.tm_sec,
-                    static_cast<int>(now_tv.tv_usec),
-                    static_cast<long long unsigned int>(thread_id));
-
-      // Print the message
-      if (p < limit) {
-        va_list backup_ap;
-        va_copy(backup_ap, ap);
-        p += vsnprintf(p, limit - p, format, backup_ap);
-        va_end(backup_ap);
-      }
-
-      // Truncate to available space if necessary
-      if (p >= limit) {
-         if (iter == 0) {
-          continue;       // Try again with larger buffer
-        } else {
-          p = limit - 1;
-        }
-      }
-
-      // Add newline if necessary
-      if (p == base || p[-1] != '\n') {
-        *p++ = '\n';
-      }
-
-      assert(p <= limit);
-      file_->Append(base, p - base).PermitUncheckedError();
-      file_->Flush(IOOptions(), nullptr).PermitUncheckedError();
-      if (base != buffer) {
-        delete[] base;
-      }
-      break;
-    }
   }
 };
 
@@ -549,4 +381,5 @@ Status CfsFileSystem::Create(const std::shared_ptr<FileSystem>& base, const std:
   return Status::OK();
 }
 }  // namespace ROCKSDB_NAMESPACE
+
 
